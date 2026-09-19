@@ -1,7 +1,0 @@
-{
-  "name": "guardbot-pro", "version": "2.0.0", "private": true,
-  "description": "Discord anti-raid and moderation bot for Drago Gaming", "main": "index.js",
-  "scripts": { "start": "node index.js", "check": "node --check index.js" },
-  "engines": { "node": ">=20" },
-  "dependencies": { "discord.js": "^14.21.0", "dotenv": "^17.2.2", "express": "^5.1.0" }
-}
