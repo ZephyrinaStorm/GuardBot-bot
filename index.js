@@ -11,9 +11,11 @@ for (const key of ['DISCORD_BOT_TOKEN', 'DISCORD_CLIENT_ID']) if (!process.env[k
 const DATA_DIR = process.env.DATA_PATH || path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const STATIC_BLACKLIST_FILE = path.join(__dirname, 'blacklist.json');
 fs.mkdirSync(BACKUP_DIR, { recursive: true });
 const loadJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } };
 const configs = loadJson(CONFIG_FILE, {});
+const staticBlacklist = new Set(loadJson(STATIC_BLACKLIST_FILE, { banned: [] }).banned.filter(id => /^\d{17,20}$/.test(id)));
 const saveConfigs = () => fs.writeFileSync(CONFIG_FILE, JSON.stringify(configs, null, 2));
 const defaults = () => ({ antiLink: true, antiSpam: true, antiRaid: true, antiBot: true, altMinimumDays: 7, altAction: 'alert', ageMinimum: 13, verifiedRoleId: null, unverifiedRoleId: null });
 const configFor = id => configs[id] ||= defaults();
@@ -24,6 +26,10 @@ const safeName = value => value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
 const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Show GuardBot commands and setup help'),
   new SlashCommandBuilder().setName('guard-status').setDescription('Show GuardBot protection status'),
+  new SlashCommandBuilder().setName('blacklist-check').setDescription('Check whether a Discord account is on the private blocklist').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
+    .addUserOption(o => o.setName('member').setDescription('Discord account to check').setRequired(true)),
+  new SlashCommandBuilder().setName('blacklist-enforce').setDescription('Ban currently present accounts matching the private blocklist').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
+    .addStringOption(o => o.setName('confirm').setDescription('Type ENFORCE to confirm').setRequired(true)),
   new SlashCommandBuilder().setName('guard-config').setDescription('Enable or disable a protection').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
     .addStringOption(o => o.setName('protection').setDescription('Protection module').setRequired(true).addChoices(
       { name: 'Anti link', value: 'antiLink' }, { name: 'Anti spam', value: 'antiSpam' },
@@ -66,13 +72,33 @@ const commands = [
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 client.once(Events.ClientReady, async ready => {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
-  const route = process.env.DISCORD_GUILD_ID ? Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID) : Routes.applicationCommands(process.env.DISCORD_CLIENT_ID);
-  await rest.put(route, { body: commands });
-  console.log(`GuardBot online as ${ready.user.tag}; ${commands.length} slash commands registered.`);
+  await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: commands });
+  console.log(`GuardBot online as ${ready.user.tag}; ${commands.length} global slash commands registered.`);
+  // Remove the matching guild commands left by earlier versions so they do not
+  // appear alongside the new global commands. Only this application's commands
+  // and only names registered by GuardBot are affected.
+  if (process.env.DISCORD_GUILD_ID) {
+    try {
+      const guildId = process.env.DISCORD_GUILD_ID;
+      const oldCommands = await rest.get(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, guildId));
+      const names = new Set(commands.map(command => command.name));
+      for (const command of oldCommands.filter(command => names.has(command.name))) {
+        await rest.delete(Routes.applicationGuildCommand(process.env.DISCORD_CLIENT_ID, guildId, command.id));
+      }
+      console.log('Removed matching legacy guild commands.');
+    } catch (error) {
+      console.error('Global commands registered, but legacy guild command cleanup failed:', error);
+    }
+  }
 });
 
 client.on(Events.GuildMemberAdd, async member => {
   const cfg = configFor(member.guild.id);
+  if (staticBlacklist.has(member.id)) {
+    if (member.bannable) await member.ban({ reason: 'GuardBot: account matched private moderation blocklist' }).catch(console.error);
+    else console.warn(`Blacklisted account ${member.id} joined ${member.guild.id}, but the bot could not ban it.`);
+    return;
+  }
   if (cfg.unverifiedRoleId) await member.roles.add(cfg.unverifiedRoleId, 'GuardBot age gate').catch(() => {});
   if (member.user.bot && cfg.antiBot && !member.user.flags?.has('VerifiedBot')) {
     if (member.bannable) await member.ban({ reason: 'GuardBot: unverified bot blocked' }).catch(console.error);
@@ -135,7 +161,20 @@ client.on(Events.InteractionCreate, async i => {
   if (!i.isChatInputCommand() || !i.guild) return;
   const reason = i.options.getString('reason') || `Action by ${i.user.tag}`;
   try {
-    if (i.commandName === 'help') return i.reply({ content: '**GuardBot Pro**\nProtection: `/guard-status`, `/guard-config`, `/alt-config`, `/alt-scan`, `/alt-remove`\nAge gate: `/agegate-setup`, `/age-verify`\nBackups: `/backup-create`, `/backup-list`, `/backup-restore`\nModeration: `/lockdown`, `/timeout`, `/kick`, `/ban`, `/purge`\nAlt detection uses Discord account age as a risk signal; it cannot prove that someone is an alt. Age verification is self-attested and does not store birth dates.', ephemeral: true });
+    if (i.commandName === 'help') return i.reply({ content: '**GuardBot Pro**\nProtection: `/guard-status`, `/guard-config`, `/blacklist-check`, `/blacklist-enforce`, `/alt-config`, `/alt-scan`, `/alt-remove`\nAge gate: `/agegate-setup`, `/age-verify`\nBackups: `/backup-create`, `/backup-list`, `/backup-restore`\nModeration: `/lockdown`, `/timeout`, `/kick`, `/ban`, `/purge`\nAlt detection uses Discord account age as a risk signal; it cannot prove that someone is an alt. Age verification is self-attested and does not store birth dates.', ephemeral: true });
+    if (i.commandName === 'blacklist-check') {
+      const user = i.options.getUser('member');
+      return i.reply({ content: staticBlacklist.has(user.id) ? `${user.tag} is on the private moderation blocklist.` : `${user.tag} is not on the private moderation blocklist.`, ephemeral: true });
+    }
+    if (i.commandName === 'blacklist-enforce') {
+      if (i.options.getString('confirm') !== 'ENFORCE') return i.reply({ content: 'Cancelled. Type ENFORCE exactly to confirm.', ephemeral: true });
+      await i.deferReply({ ephemeral: true });
+      await i.guild.members.fetch();
+      const matches = [...i.guild.members.cache.values()].filter(member => staticBlacklist.has(member.id));
+      let banned = 0;
+      for (const member of matches) if (member.bannable) { await member.ban({ reason: 'GuardBot: account matched private moderation blocklist' }); banned++; }
+      return i.editReply(`Blocklist enforcement complete: ${banned} matching account(s) banned. ${matches.length - banned} could not be banned because of role or permission limits.`);
+    }
     if (i.commandName === 'guard-status') {
       const c = configFor(i.guild.id);
       return i.reply({ content: `Anti-link: ${c.antiLink?'on':'off'}\nAnti-spam: ${c.antiSpam?'on':'off'}\nAnti-raid: ${c.antiRaid?'on':'off'}\nBlock unverified bots: ${c.antiBot?'on':'off'}\nAlt threshold: ${c.altMinimumDays} days (${c.altAction})\nAge gate: ${c.ageMinimum}+`, ephemeral: true });
