@@ -12,7 +12,5 @@ services:
         sync: false
       - key: DISCORD_CLIENT_ID
         sync: false
-      - key: DISCORD_GUILD_ID
-        sync: false
       - key: DATA_PATH
         value: ./data
