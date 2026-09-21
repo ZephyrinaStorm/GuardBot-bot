@@ -7,7 +7,7 @@ const {
   SlashCommandBuilder, ChannelType
 } = require('discord.js');
 
-for (const key of ['DISCORD_BOT_TOKEN', 'DISCORD_CLIENT_ID']) if (!process.env[key]) throw new Error(`${key} is required`);
+if (!process.env.DISCORD_BOT_TOKEN) throw new Error('DISCORD_BOT_TOKEN is required');
 const DATA_DIR = process.env.DATA_PATH || path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
@@ -82,18 +82,28 @@ const commands = [
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 client.once(Events.ClientReady, async ready => {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
-  await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: commands });
-  console.log(`GuardBot online as ${ready.user.tag}; ${commands.length} global slash commands registered.`);
+  // A bot user's ID is its application ID. Derive it from the logged-in token
+  // so a stale DISCORD_CLIENT_ID setting cannot target a different app.
+  const applicationId = ready.user.id;
+  if (process.env.DISCORD_CLIENT_ID && process.env.DISCORD_CLIENT_ID !== applicationId) {
+    console.warn('DISCORD_CLIENT_ID does not match the logged-in bot; ignoring it.');
+  }
+  try {
+    await rest.put(Routes.applicationCommands(applicationId), { body: commands });
+    console.log(`GuardBot online as ${ready.user.tag}; ${commands.length} global slash commands registered.`);
+  } catch (error) {
+    console.error('Could not register global commands for this bot application:', error);
+  }
   // Remove the matching guild commands left by earlier versions so they do not
   // appear alongside the new global commands. Only this application's commands
   // and only names registered by GuardBot are affected.
   if (process.env.DISCORD_GUILD_ID) {
     try {
       const guildId = process.env.DISCORD_GUILD_ID;
-      const oldCommands = await rest.get(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, guildId));
+      const oldCommands = await rest.get(Routes.applicationGuildCommands(applicationId, guildId));
       const names = new Set([...commands.map(command => command.name), 'blacklist-check', 'blacklist-enforce']);
       for (const command of oldCommands.filter(command => names.has(command.name))) {
-        await rest.delete(Routes.applicationGuildCommand(process.env.DISCORD_CLIENT_ID, guildId, command.id));
+        await rest.delete(Routes.applicationGuildCommand(applicationId, guildId, command.id));
       }
       console.log('Removed matching legacy guild commands.');
     } catch (error) {
@@ -110,6 +120,7 @@ client.once(Events.ClientReady, async ready => {
     }
   }
 });
+client.on(Events.Error, error => console.error('Discord gateway error:', error));
 
 client.on(Events.GuildMemberAdd, async member => {
   if (await banBlacklisted(member, readBlacklist())) return;
